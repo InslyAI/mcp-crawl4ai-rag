@@ -552,16 +552,27 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         crawler = ctx.request_context.lifespan_context.crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
         
+        # Initialize progress tracking
+        total_steps = 5  # Base steps: analyze, crawl, process, summarize, store
+        current_step = 0
+        
+        # Step 1: Analyze URL type
+        ctx.info(f"Analyzing URL type for: {url}")
+        await ctx.report_progress(current_step, total_steps)
+        current_step += 1
+        
         # Determine the crawl strategy
         crawl_results = []
         crawl_type = None
         
         if is_txt(url):
             # For text files, use simple crawl
+            ctx.info("Crawling text file...")
             crawl_results = await crawl_markdown_file(crawler, url)
             crawl_type = "text_file"
         elif is_sitemap(url):
             # For sitemaps, extract URLs and crawl in parallel
+            ctx.info("Extracting URLs from sitemap...")
             sitemap_urls = parse_sitemap(url)
             if not sitemap_urls:
                 return json.dumps({
@@ -569,10 +580,32 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                     "url": url,
                     "error": "No URLs found in sitemap"
                 }, indent=2)
-            crawl_results = await crawl_batch(crawler, sitemap_urls, max_concurrent=max_concurrent)
+            
+            # Update total steps based on batches (to avoid too many progress updates)
+            batch_size = 10
+            num_batches = (len(sitemap_urls) + batch_size - 1) // batch_size
+            total_steps = 4 + num_batches  # analyze, crawl batches, process, summarize, store
+            ctx.info(f"Found {len(sitemap_urls)} URLs to crawl in {num_batches} batches")
+            
+            # Crawl URLs in batches with progress tracking
+            crawl_results = []
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, len(sitemap_urls))
+                batch_urls = sitemap_urls[start_idx:end_idx]
+                
+                ctx.info(f"Crawling batch {batch_idx + 1}/{num_batches} ({len(batch_urls)} URLs)")
+                await ctx.report_progress(current_step, total_steps)
+                
+                # Crawl batch
+                batch_results = await crawl_batch(crawler, batch_urls, max_concurrent=max_concurrent)
+                crawl_results.extend(batch_results)
+                current_step += 1
+            
             crawl_type = "sitemap"
         else:
             # For regular URLs, use recursive crawl
+            ctx.info(f"Recursively crawling links (max depth: {max_depth})...")
             crawl_results = await crawl_recursive_internal_links(crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent)
             crawl_type = "webpage"
         
@@ -582,6 +615,11 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 "url": url,
                 "error": "No content found"
             }, indent=2)
+        
+        # Step 2: Process content
+        ctx.info(f"Processing content from {len(crawl_results)} pages...")
+        await ctx.report_progress(current_step, total_steps)
+        current_step += 1
         
         # Process results and store in Supabase
         urls = []
@@ -595,7 +633,10 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         source_word_counts = {}
         
         # Process documentation chunks
-        for doc in crawl_results:
+        for doc_idx, doc in enumerate(crawl_results):
+            # Report progress every 10 documents
+            if doc_idx > 0 and doc_idx % 10 == 0:
+                ctx.info(f"Processed {doc_idx}/{len(crawl_results)} documents")
             source_url = doc['url']
             md = doc['markdown']
             chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
@@ -633,6 +674,11 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         for doc in crawl_results:
             url_to_full_document[doc['url']] = doc['markdown']
         
+        # Step 3: Generate source summaries
+        ctx.info(f"Generating summaries for {len(source_content_map)} sources...")
+        await ctx.report_progress(current_step, total_steps)
+        current_step += 1
+        
         # Update source information for each unique source FIRST (before inserting documents)
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             source_summary_args = [(source_id, content) for source_id, content in source_content_map.items()]
@@ -642,17 +688,26 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             word_count = source_word_counts.get(source_id, 0)
             update_source_info(supabase_client, source_id, summary, word_count)
         
+        # Step 4: Store in database
+        ctx.info(f"Storing {chunk_count} chunks in database...")
+        await ctx.report_progress(current_step, total_steps)
+        current_step += 1
+        
         # Add documentation chunks to Supabase (AFTER sources exist)
         batch_size = 20
         add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
         
         # Extract and process code examples from all documents only if enabled
         extract_code_examples_enabled = os.getenv("USE_AGENTIC_RAG", "false") == "true"
+        code_examples = []  # Initialize outside the if block for the response
+        
         if extract_code_examples_enabled:
-            all_code_blocks = []
+            # Step 5: Extract code examples
+            ctx.info("Extracting and processing code examples...")
+            await ctx.report_progress(current_step, total_steps)
+            
             code_urls = []
             code_chunk_numbers = []
-            code_examples = []
             code_summaries = []
             code_metadatas = []
             
@@ -703,6 +758,10 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                     code_metadatas,
                     batch_size=batch_size
                 )
+        
+        # Final progress update
+        ctx.info("Crawling completed successfully!")
+        await ctx.report_progress(total_steps, total_steps)
         
         return json.dumps({
             "success": True,
